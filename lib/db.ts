@@ -57,6 +57,10 @@ export const pool: Pool =
         connectionString,
         // In development, always bypass certificate verification to avoid local TLS issues.
         ssl: sslRequired ? { rejectUnauthorized: false } : undefined,
+        // Reduce connection resets on some hosts
+        keepAlive: true,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
       });
 
 if (process.env.NODE_ENV !== 'production') {
@@ -64,8 +68,34 @@ if (process.env.NODE_ENV !== 'production') {
   globalAny.__PG_POOL_KEY = POOL_KEY;
 }
 
+function isTransientError(err: any): boolean {
+  const code = String((err && (err.code || err.errno)) || '').toUpperCase();
+  const msg = String(err && (err.message || err.toString() || '')).toLowerCase();
+  // Node-level socket errors
+  if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ETIMEDOUT') return true;
+  // Common PG SQLSTATEs indicating connection issues
+  const pgCode = String(err && err.code).toUpperCase();
+  if (pgCode === '57P01' /* admin_shutdown */ || pgCode === '08006' /* connection_failure */ || pgCode === '08003' /* connection_does_not_exist */) return true;
+  if (msg.includes('connection terminated') || msg.includes('server closed the connection')) return true;
+  return false;
+}
+
 export async function query<T extends QueryResultRow = QueryResultRow>(text: string, params?: unknown[]): Promise<QueryResult<T>> {
-  return pool.query<T>(text, params as any[] | undefined);
+  try {
+    return await pool.query<T>(text, params as any[] | undefined);
+  } catch (e: any) {
+    if (isTransientError(e)) {
+      try {
+        // eslint-disable-next-line no-console
+        console.warn('[db] transient error, retrying once:', e?.code || e?.message || e);
+        await new Promise((r) => setTimeout(r, 200));
+        return await pool.query<T>(text, params as any[] | undefined);
+      } catch (e2) {
+        throw e2;
+      }
+    }
+    throw e;
+  }
 }
 
 export async function tx<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
